@@ -47,7 +47,7 @@ Designed for penetration testers, students, and CTF players, DarkPurl streamline
 Clone the repository:
 
 ```bash
-git clone https://github.com/<your-username>/DarkPurl.git
+git clone https://github.com/Mal3vAntCtrl/DarkPurl.git
 cd DarkPurl
 ```
 
