@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DARKPURL - a curl-native HTTP inspection tool for pentest/CTF lab work.
+DARKPURL - a curl-native HTTP/s inspection tool for pentest/CTF lab work.
 
 Core idea: curl is already the right tool for this - versatile, everywhere,
 scriptable. This just removes the need to memorize/retype its syntax every
