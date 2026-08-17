@@ -24,6 +24,13 @@ WWW-Authenticate, redirects, 5xx bodies, etc.) and, opt-in, offers
 follow-ups (OPTIONS/HEAD/verbose re-run/carry a cookie forward) - never
 automatic, always a menu you choose from.
 
+Responses are also scanned for patterns that are WORTH MANUALLY TESTING
+FURTHER - error strings, reflected input, structural hints. This is a
+fingerprinting/triage layer only: it never crafts or sends payloads, never
+decides anything is confirmed, and never runs an active test on its own.
+It just names a category and points at what a human should go check by
+hand, the same way Nikto/Wappalyzer-style tools flag "worth a look."
+
 No external dependencies - stdlib only, so it runs anywhere curl does.
 Recipes persist in ~/.curlmenu/recipes.json, sitemaps in
 ~/.curlmenu/sitemap_<host>.json, and every executed command is logged
@@ -37,28 +44,30 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
 STORE_DIR = Path.home() / ".curlmenu"
 STORE_FILE = STORE_DIR / "recipes.json"
 HISTORY_FILE = STORE_DIR / "history.log"
+FINDINGS_FILE = STORE_DIR / "findings.json"
 PROMPT_STR = "DARKPURL > "
 
-STATE = {"target": "", "last_values": {}, "scheme": "http", "port": "", "last_command": ""}
+STATE = {"target": "", "last_values": {}, "scheme": "http", "port": "", "last_command": "", "last_recipe": None, "last_raw": None, "last_pasted": "", "beginner_mode": True}
 
 CATEGORIES = [
-    ("0", "quicklook", "Quick single request (start here if you're not sure)"),
-    ("1", "login", "Login portal test"),
+    ("0", "quicklook", "Quick look"),
+    ("1", "login", "Login test"),
     ("2", "api", "API check"),
-    ("3", "enum", "Directory / file enum"),
-    ("4", "injection", "Custom value test (query/body/header)"),
+    ("3", "enum", "Check a path"),
+    ("4", "injection", "Custom value test"),
     ("5", "session", "Session / cookie test"),
-    ("6", "raw", "Raw / custom curl"),
-    ("7", "crawl", "Crawl mode (extract links/API paths from a page)"),
-    ("8", "bruteenum", "Enum mode (probe common backend paths)"),
-    ("9", "paste", "Paste an existing curl command (import)"),
-    ("r", "builder", "Full request builder (set method/headers/cookies/body by hand)"),
+    ("6", "raw", "Saved custom requests"),
+    ("7", "crawl", "Crawl mode"),
+    ("8", "bruteenum", "Enum mode"),
+    ("9", "paste", "Paste a curl command"),
+    ("r", "builder", "Full request builder"),
 ]
 
 BUILTIN_RECIPES = [
@@ -147,11 +156,6 @@ BUILTIN_RECIPES = [
         "category": "session",
         "template": "curl -s -i -b '{cookie_name}={cookie_value}' {scheme}://{target}{path}",
     },
-    {
-        "name": "Freeform curl (you type the rest)",
-        "category": "raw",
-        "template": "curl {raw_args} {scheme}://{target}{path}",
-    },
 ]
 
 PLACEHOLDER_RE = re.compile(r"(?<!\{)\{(\w+)\}(?!\})")
@@ -172,8 +176,6 @@ def save_recipes(recipes):
 
 
 def placeholders_in(template):
-    # keep order of first appearance, drop duplicates, always exclude
-    # "target"/"scheme" - those are set once globally, not per-recipe
     seen = []
     for name in PLACEHOLDER_RE.findall(template):
         if name not in ("target", "scheme") and name not in seen:
@@ -182,7 +184,6 @@ def placeholders_in(template):
 
 
 def ask(text):
-    """Print a question/info line, blank space, an input cue, then the prompt."""
     print(f"\n{text}\n")
     print("Your input below:")
     return input(PROMPT_STR).strip()
@@ -195,8 +196,32 @@ def prompt(text, default=None, example=None):
     return val if val else (default or "")
 
 
+def yn_prompt(text, default=False):
+    """Yes/no prompt where blank input keeps the given default instead of
+    always meaning 'no' - lets a repeated flow stay silent when nothing
+    needs to change."""
+    suffix = " [Y/n]" if default else " [y/N]"
+    val = ask(f"{text}{suffix}").lower()
+    if not val:
+        return default
+    return val == "y"
+
+
+def with_reuse(question, last_value, collect_fn, default=True):
+    """
+    The one 'reuse what I typed last time, or ask fresh' pattern used
+    everywhere a piece of a request (method, headers, body, a pasted
+    command...) might be identical to the last time this exact step ran.
+    last_value is falsy -> always falls through to collect_fn(). Otherwise
+    offers a single yes/no and either hands back last_value untouched or
+    calls collect_fn() to gather it again.
+    """
+    if last_value and yn_prompt(question, default=default):
+        return last_value
+    return collect_fn()
+
+
 def choose(options, title, allow_back=True):
-    """options: list of (key, label). Returns chosen key, or None if back/quit."""
     print(f"\n{title}")
     for key, label in options:
         print(f"  {key}) {label}")
@@ -225,14 +250,21 @@ def category_menu():
     if STATE["last_command"]:
         print(f"Last command: {STATE['last_command']}")
         print("(press 'h' for full history)\n")
-    opts = [(k, label) for k, _, label in CATEGORIES]
-    opts.append(("m", "Show known sitemap for this target"))
-    opts.append(("h", "Show command history"))
+    opts = [("a", "Auto-scan (crawl + find issues fast)")]
+    opts += [(k, label) for k, _, label in CATEGORIES]
+    if STATE.get("last_recipe"):
+        opts.insert(1, ("e", f"Repeat/edit last [{STATE['last_recipe']['name']}]"))
+    opts.append(("c", "Compare mode"))
+    opts.append(("m", "Sitemap"))
+    opts.append(("f", "Findings log"))
+    opts.append(("h", "History"))
     opts.append(("t", "Change target"))
-    opts.append(("s", f"Toggle scheme (currently {STATE['scheme']})"))
-    opts.append(("p", f"Change port (currently {STATE['port'] or 'default'})"))
+    opts.append(("s", f"Scheme ({STATE['scheme']})"))
+    opts.append(("p", f"Port ({STATE['port'] or 'default'})"))
+    opts.append(("x", f"'What this means' notes on findings ({'on' if STATE.get('beginner_mode') else 'off'})"))
+    opts.append(("?", "What do these mean?"))
     print(f"Target: {base_url()}")
-    return choose(opts, "What would you like to do?", allow_back=False)
+    return choose(opts, "Menu:", allow_back=False)
 
 
 def category_key_for(choice_num):
@@ -245,7 +277,11 @@ def category_key_for(choice_num):
 def recipe_menu(cat_key, all_recipes):
     matching = [r for r in all_recipes if r["category"] == cat_key]
     if not matching:
-        print("No recipes in this category yet.")
+        if cat_key == "raw":
+            print("Nothing saved here yet - build one with 'r' (full request builder) or save a")
+            print("pasted command with '9', and it'll show up in this list from then on.")
+        else:
+            print("No recipes in this category yet.")
         return None
     opts = [(str(i + 1), r["name"]) for i, r in enumerate(matching)]
     choice = choose(opts, "Pick a recipe:")
@@ -323,8 +359,8 @@ FLAG_GLOSSARY = {
     "--compressed": "request a compressed response and auto-decompress it",
 }
 
+
 def explain_command(command):
-    """Print a plain-language breakdown of the flags in a curl command."""
     try:
         tokens = shlex.split(command)
     except ValueError as e:
@@ -397,18 +433,8 @@ INTERESTING_HEADERS = [
     "x-generator", "via", "www-authenticate", "x-runtime", "x-drupal-cache",
 ]
 
-BODY_MARKERS = [
-    "traceback (most recent call last)",
-    "fatal error",
-    "warning: ",
-    "stack trace",
-    "index of /",
-    "internal server error",
-]
-
 
 def parse_response(text):
-    """Split a curl -i response into (status_code, headers dict, body)."""
     lines = text.splitlines()
     status_code = None
     headers = {}
@@ -430,7 +456,26 @@ def parse_response(text):
     return status_code, headers, body
 
 
-def detect_signals(status_code, headers, body):
+def print_vuln_flag(line_no, snippet, tag, hint):
+    """One consistent way to print a flagged finding, with an optional
+    plain-language explanation underneath when beginner mode is on."""
+    where = f"line {line_no}" if line_no else "header/context"
+    print(f"  [{where}] {tag} - {hint}")
+    print(f"      {snippet}")
+    if STATE.get("beginner_mode"):
+        explanation = explain_tag(tag)
+        if explanation:
+            print(f"      ↳ what this means: {explanation}")
+
+
+def detect_signals(status_code, headers):
+    """
+    Header/status-level signals only. Anything about the BODY (error
+    strings, stack traces, reflected values, etc.) is handled entirely by
+    suggest_vulns() below, with a line number attached - keeping one
+    flagging pipeline instead of two overlapping ones that'd repeat
+    themselves in the output.
+    """
     signals = []
     for h in INTERESTING_HEADERS:
         if h in headers:
@@ -440,25 +485,357 @@ def detect_signals(status_code, headers, body):
     if "location" in headers:
         signals.append(f"location (redirect target): {headers['location']}")
     if status_code and status_code >= 500:
-        signals.append(f"server error ({status_code}) - body may hold a stack trace worth reading in full")
+        signals.append(f"server error ({status_code}) - body flags below may explain why")
     if status_code in (401, 403):
         signals.append(f"access denied ({status_code}) - this path likely needs auth")
-
-    body_lower = body.lower()
-    for marker in BODY_MARKERS:
-        if marker in body_lower:
-            signals.append(f"body contains '{marker.strip()}' - looks like verbose/debug error output")
-            break
-
     return signals
 
 
+
+# --- vulnerability-category suggester -----------------------------------
+#
+# Passive pattern matching only. This never crafts, mutates, or sends a
+# payload, and it never claims a finding is confirmed - it points at the
+# specific line that tripped a pattern, names a short vulnerability tag,
+# and leaves everything else to the human. Think of it as a fingerprinting
+# layer, same spirit as detect_signals() above, just line-level and much
+# broader. Hints are kept to a few words on purpose - just enough to know
+# what to go test, not a write-up.
+
+# (regex, short tag, few-word hint) - checked one line of the body at a time,
+# so a hit always has a concrete line number/snippet to point at.
+VULN_LINE_PATTERNS = [
+    # --- SQL injection (per-dialect error strings) ---
+    (re.compile(r"sql syntax.*mysql|you have an error in your sql syntax", re.I), "SQLi (MySQL)", "MySQL syntax error leaked"),
+    (re.compile(r"unclosed quotation mark after the character string|mssql|sqlsrv", re.I), "SQLi (MSSQL)", "MSSQL error string"),
+    (re.compile(r"quoted string not properly terminated|ORA-\d{5}", re.I), "SQLi (Oracle)", "Oracle error string"),
+    (re.compile(r"pg_query\(\)|postgresql.*error|invalid input syntax for", re.I), "SQLi (PostgreSQL)", "Postgres error string"),
+    (re.compile(r"sqlite3?\.(OperationalError|Warning)|near \".*\": syntax error", re.I), "SQLi (SQLite)", "SQLite error string"),
+    (re.compile(r"System\.Data\.SqlClient|Npgsql\.", re.I), "SQLi (.NET DB layer)", ".NET DB exception leaked"),
+    (re.compile(r"org\.hibernate\.exception|could not execute query", re.I), "SQLi (Hibernate/JPA)", "ORM exception leaked"),
+
+    # --- NoSQL / other query injection ---
+    (re.compile(r"MongoError|E11000 duplicate key|BSONObj|\$where.*not allowed", re.I), "NoSQLi (MongoDB)", "Mongo error string"),
+    (re.compile(r"com\.couchbase\.client|CouchbaseException", re.I), "NoSQLi (Couchbase)", "Couchbase error string"),
+    (re.compile(r"redis\.exceptions|WRONGTYPE|ERR wrong number of arguments", re.I), "Possible Redis command injection", "Redis error string"),
+    (re.compile(r"javax\.naming\.NamingException|LDAPException|invalid DN syntax", re.I), "LDAP injection", "LDAP error string"),
+    (re.compile(r"XPathException|XPATH syntax error", re.I), "XPath injection", "XPath error string"),
+    (re.compile(r"GraphQL error|Cannot query field|did you mean", re.I), "GraphQL error leak", "GraphQL resolver error"),
+    (re.compile(r'"__schema"\s*:|"queryType"\s*:', re.I), "GraphQL introspection enabled", "schema introspection exposed"),
+
+    # --- Server-side template injection (per engine) ---
+    (re.compile(r"jinja2\.exceptions|TemplateSyntaxError", re.I), "SSTI (Jinja2)", "Jinja2 error leaked"),
+    (re.compile(r"freemarker\.core|FreeMarker template error", re.I), "SSTI (FreeMarker)", "FreeMarker error leaked"),
+    (re.compile(r"org\.thymeleaf|thymeleaf\.exceptions", re.I), "SSTI (Thymeleaf)", "Thymeleaf error leaked"),
+    (re.compile(r"twig_error|Twig\\Error", re.I), "SSTI (Twig)", "Twig error leaked"),
+    (re.compile(r"smarty[_.]?(compile|runtime)?error", re.I), "SSTI (Smarty)", "Smarty error leaked"),
+    (re.compile(r"velocity\.exception|ParseErrorException", re.I), "SSTI (Velocity)", "Velocity error leaked"),
+    (re.compile(r"HandlebarsException|Handlebars\.compile", re.I), "SSTI (Handlebars)", "Handlebars error leaked"),
+    (re.compile(r"pug.*compile error|jade.*compile error", re.I), "SSTI (Pug/Jade)", "Pug/Jade error leaked"),
+    (re.compile(r"ActionView::Template::Error|ERB::CompileError", re.I), "SSTI (ERB/Rails)", "ERB error leaked"),
+    (re.compile(r"mustache\.js|Unclosed section", re.I), "SSTI (Mustache)", "Mustache error leaked"),
+
+    # --- Command / OS injection ---
+    (re.compile(r"sh: .*: command not found|/bin/sh: \d+:|/bin/bash: .*: command not found", re.I),
+     "OS command injection", "shell error leaked"),
+    (re.compile(r"is not recognized as an internal or external command", re.I),
+     "OS command injection (Windows)", "cmd.exe error leaked"),
+    (re.compile(r"sh: syntax error|unexpected EOF while looking for matching", re.I),
+     "OS command injection", "shell syntax error leaked"),
+
+    # --- Path traversal / LFI / RFI ---
+    (re.compile(r"root:.*:0:0:", re.I), "LFI / path traversal", "looks like /etc/passwd content"),
+    (re.compile(r"\[boot loader\]|\[fonts\]\s*$", re.I), "LFI / path traversal", "looks like Windows boot.ini/win.ini content"),
+    (re.compile(r"failed to open stream|include\(\).*failed to open|require\(\).*failed to open", re.I),
+     "LFI (PHP include/require)", "PHP file-open failure leaked"),
+    (re.compile(r"allow_url_include|allow_url_fopen", re.I), "Possible RFI (PHP)", "remote-include config referenced"),
+
+    # --- XXE ---
+    (re.compile(r"org\.xml\.sax\.SAXParseException|DOCTYPE is disallowed|external entity|SYSTEM \".*\"", re.I),
+     "XXE (XML external entity)", "XML parser/entity error leaked"),
+    (re.compile(r"lxml\.etree\.XMLSyntaxError|xml\.parsers\.expat\.ExpatError", re.I),
+     "XXE (XML external entity)", "Python XML parser error leaked"),
+
+    # --- Insecure deserialization ---
+    (re.compile(r"java\.io\.(InvalidClassException|StreamCorruptedException|OptionalDataException)|readObject", re.I),
+     "Insecure deserialization (Java)", "Java deserialize error leaked"),
+    (re.compile(r"unserialize\(\).*Error|__PHP_Incomplete_Class", re.I),
+     "Insecure deserialization (PHP)", "PHP unserialize() error leaked"),
+    (re.compile(r"pickle\.UnpicklingError|_pickle\.UnpicklingError", re.I),
+     "Insecure deserialization (Python pickle)", "pickle error leaked"),
+    (re.compile(r"System\.Runtime\.Serialization|BinaryFormatter\.Deserialize|TypeNameHandling", re.I),
+     "Insecure deserialization (.NET)", ".NET deserialize reference leaked"),
+    (re.compile(r"com\.fasterxml\.jackson.*PolymorphicTypeValidator|@class\"\s*:", re.I),
+     "Insecure deserialization (Jackson polymorphic)", "Jackson polymorphic type hint leaked"),
+
+    # --- SSRF hints ---
+    (re.compile(r"169\.254\.169\.254|metadata\.google\.internal|/latest/meta-data", re.I),
+     "Possible SSRF (cloud metadata reachable)", "cloud metadata endpoint referenced"),
+
+    # --- Auth / JWT / crypto hints ---
+    (re.compile(r'"alg"\s*:\s*"none"', re.I), "JWT 'alg:none' accepted", "unsigned JWT alg referenced"),
+    (re.compile(r"jwt\.exceptions\.|InvalidSignatureError|InvalidAlgorithmError", re.I),
+     "JWT validation error leaked", "JWT library error leaked"),
+
+    # --- Framework / CMS debug pages ---
+    (re.compile(r"django\.core\.exceptions|DisallowedHost|DEBUG = True|Django Version:", re.I),
+     "Framework debug exposed (Django)", "Django debug page"),
+    (re.compile(r"werkzeug|flask\.debughelpers|Werkzeug Debugger", re.I),
+     "Framework debug exposed (Flask)", "Werkzeug debug output"),
+    (re.compile(r"whoops|laravel.*exception|Illuminate\\", re.I),
+     "Framework debug exposed (Laravel)", "Whoops/Laravel error page"),
+    (re.compile(r"Whitelabel Error Page|org\.springframework\.", re.I),
+     "Framework debug exposed (Spring Boot)", "Spring stack trace/whitelabel page"),
+    (re.compile(r"System\.Web\.HttpException|Server Error in '/' Application", re.I),
+     "Framework debug exposed (ASP.NET)", "ASP.NET yellow screen of death"),
+    (re.compile(r"at Object\.<anonymous>|Error: Cannot GET|node_modules[\\/]", re.I),
+     "Framework debug exposed (Node/Express)", "Node stack trace leaked"),
+    (re.compile(r"ActionController::RoutingError|Rails\.root|ActiveRecord::", re.I),
+     "Framework debug exposed (Rails)", "Rails error page"),
+    (re.compile(r"phpinfo\(\)|PHP Version =>", re.I),
+     "phpinfo() exposed", "full PHP config disclosure"),
+
+    # --- CMS fingerprints worth checking against known CVEs ---
+    (re.compile(r"wp-content/plugins/|wp-json/|/wp-includes/", re.I),
+     "WordPress detected", "check plugin/core versions for CVEs"),
+    (re.compile(r"Drupal\.settings|/sites/default/files/|X-Generator: Drupal", re.I),
+     "Drupal detected", "check core/module versions for CVEs"),
+    (re.compile(r"/components/com_|Joomla!", re.I),
+     "Joomla detected", "check component versions for CVEs"),
+    (re.compile(r"Magento_|/skin/frontend/", re.I),
+     "Magento detected", "check version for known CVEs"),
+
+    # --- Generic stack traces / verbose errors / info disclosure ---
+    (re.compile(r"traceback \(most recent call last\)", re.I), "Stack trace leaked (Python)", "full traceback in body"),
+    (re.compile(r"stack trace", re.I), "Stack trace leaked", "stack trace string present"),
+    (re.compile(r"fatal error", re.I), "Verbose error output", "fatal error string leaked"),
+    (re.compile(r"^warning: ", re.I), "Verbose error output", "raw warning/notice leaked"),
+    (re.compile(r"internal server error", re.I), "Verbose error output", "raw 5xx error page returned"),
+    (re.compile(r"index of /", re.I), "Directory listing exposed", "autoindex is on"),
+    (re.compile(r"\.git/HEAD|ref: refs/heads/", re.I), "Exposed .git", "git internals reachable"),
+    (re.compile(r"DB_PASSWORD|DB_USERNAME=|APP_KEY=|AWS_SECRET_ACCESS_KEY", re.I), "Exposed secrets/.env", "credential-like var leaked"),
+]
+
+# Plain-language, one-or-two-sentence explanations for someone new to this.
+# Keyed by "family" - the part of the tag before any "(Engine)" suffix - so
+# every per-database/per-template-engine variant shares one explanation
+# instead of needing 30 near-duplicate blurbs. Looked up in explain_tag().
+BEGINNER_EXPLAINERS = {
+    "SQLi": "The app's error message looks like it came straight from a database query. "
+            "That can mean your input is being pasted into a SQL query without being cleaned up first - "
+            "which is what SQL Injection attacks target.",
+    "NoSQLi": "Same idea as SQL Injection, but for a NoSQL database like MongoDB - "
+              "an error like this suggests input might reach the database query directly.",
+    "LDAP injection": "This error suggests input might be reaching a directory-service (LDAP) query unfiltered - "
+                       "similar risk to SQL injection, just for a different kind of database.",
+    "XPath injection": "This error suggests input might be reaching an XML query unfiltered - "
+                        "worth checking if you can manipulate what data it returns.",
+    "GraphQL": "GraphQL APIs describe their whole data model in one place. If introspection is on, "
+               "or errors leak resolver details, it's easier to map out what data exists.",
+    "SSTI": "Server-Side Template Injection. The app might be running a page-template engine on your input "
+            "directly, which in the worst case can let you execute code on the server.",
+    "OS command injection": "This looks like a shell/command-line error. If input is reaching a system command, "
+                             "that's one of the most serious bug classes there is - it can mean full server control.",
+    "LFI": "Local File Inclusion. The app might let a filename parameter pull in files from elsewhere on the "
+           "server that you're not supposed to see (like /etc/passwd or config files).",
+    "RFI": "Remote File Inclusion. The app's file-include setting might let it load and run a file from a "
+           "URL you control - a step up in severity from LFI.",
+    "XXE": "XML External Entity. If the app parses XML you send it, a crafted entity might let you read local "
+           "files or make the server send requests on your behalf.",
+    "Insecure deserialization": "The app appears to convert incoming data back into objects/data structures. "
+                                 "If that data isn't trusted, this pattern is a classic way to run code on the server.",
+    "Possible SSRF": "Server-Side Request Forgery. Something in the response suggests the server might make "
+                      "requests to internal addresses (like cloud metadata) on your behalf.",
+    "JWT": "JSON Web Tokens carry login/session info. If the server accepts a token with no signature, or leaks "
+           "verification errors, its auth might be easier to forge than it should be.",
+    "Framework debug exposed": "Debug mode looks like it's turned on. Debug pages often leak source code, "
+                                "config values, and full stack traces that should never be public.",
+    "phpinfo() exposed": "A phpinfo() page dumps the entire PHP configuration - versions, paths, sometimes "
+                          "even credentials. It should never be reachable on a live site.",
+    "WordPress detected": "WordPress often has known vulnerabilities in outdated plugins/themes - "
+                           "worth checking the exact versions in use against public advisories.",
+    "Drupal detected": "Same idea as WordPress - check the Drupal core/module versions against known CVEs.",
+    "Joomla detected": "Same idea as WordPress - check the Joomla component versions against known CVEs.",
+    "Magento detected": "Same idea as WordPress - check the Magento version against known CVEs.",
+    "Stack trace leaked": "A full error trace is showing. Besides being embarrassing for the developers, "
+                           "it often reveals file paths, library versions, and logic worth knowing about.",
+    "Verbose error output": "The app is showing a raw, developer-facing error instead of a clean error page - "
+                             "worth reading in full for anything sensitive.",
+    "Directory listing exposed": "The web server is showing a raw file listing instead of a normal page - "
+                                  "you can literally browse what files exist in that folder.",
+    "Exposed .git": "The .git folder is reachable, which can mean the entire source code history - "
+                     "including anything ever committed, like old passwords - can be downloaded.",
+    "Exposed secrets/.env": "Something that looks like a real credential or secret key showed up in the "
+                             "response. Treat this as sensitive - don't paste it anywhere public.",
+    "Reflected input": "The value you typed came back unchanged in the page. This is the first ingredient "
+                        "for Cross-Site Scripting (XSS) - worth checking if it's properly escaped.",
+    "Possible IDOR": "Insecure Direct Object Reference. The request uses a plain ID (like a number) to pick "
+                      "a record. Try changing it slightly and see if you get someone else's data back.",
+    "Cookie hardening gap": "A session cookie is missing a security flag (HttpOnly/Secure/SameSite). "
+                             "These flags reduce the damage an attacker can do even if they find another bug.",
+    "Possible open redirect": "The server's redirect target looks like it includes something you typed. "
+                               "If so, this URL could be reused to send people somewhere malicious while "
+                               "looking like it comes from the real site.",
+    "CORS misconfiguration": "The CORS policy allows any website to make authenticated requests here - "
+                              "that's usually a real bug, not just permissive by design.",
+    "Permissive CORS": "The CORS policy allows any website to read this response. Fine for public data, "
+                        "worth double-checking there's nothing sensitive in it.",
+}
+
+
+def explain_tag(tag):
+    """Look up a plain-language explanation for a vuln tag. Tags like
+    'SQLi (MySQL)' fall back to the family before the parenthesis
+    ('SQLi'), and any tag containing a known key (like 'Possible RFI
+    (PHP)' containing 'RFI') falls back to a substring match, so one
+    explainer covers every variant of a tag."""
+    if tag in BEGINNER_EXPLAINERS:
+        return BEGINNER_EXPLAINERS[tag]
+    family = tag.split(" (")[0]
+    if family in BEGINNER_EXPLAINERS:
+        return BEGINNER_EXPLAINERS[family]
+    # Longest-key-first so a specific key (e.g. "Framework debug exposed")
+    # wins over a shorter one that might also appear as a substring.
+    for key in sorted(BEGINNER_EXPLAINERS, key=len, reverse=True):
+        if key in tag:
+            return BEGINNER_EXPLAINERS[key]
+    return None
+
+
+def suggest_vulns(status_code, headers, body, request_values=None):
+    """
+    Return a list of (line_no, line_snippet, tag, hint) tuples pointing at
+    the exact line that tripped a pattern, plus a couple of structural
+    (header/context) checks that don't map to a single body line - those
+    use line_no=None. Advisory only: names what to go check, never a
+    payload, never a confirmation.
+    """
+    found = []
+    body_text = body or ""
+    lines = body_text.splitlines()
+
+    for line_no, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        for pattern, tag, hint in VULN_LINE_PATTERNS:
+            if pattern.search(line):
+                snippet = line.strip()
+                if len(snippet) > 100:
+                    snippet = snippet[:97] + "..."
+                found.append((line_no, snippet, tag, hint))
+
+    # Reflected input - precondition for XSS/SSTI, no single "line" to
+    # blame beyond wherever it shows up, so report the first occurrence.
+    if request_values:
+        for field, val in request_values.items():
+            if field in ("target", "scheme", "path"):
+                continue
+            if isinstance(val, str) and len(val) >= 3 and val in body_text:
+                idx = body_text.find(val)
+                line_no = body_text.count("\n", 0, idx) + 1
+                snippet = lines[line_no - 1].strip() if line_no - 1 < len(lines) else val
+                if len(snippet) > 100:
+                    snippet = snippet[:97] + "..."
+                found.append((line_no, snippet, "Reflected input", f"your '{field}' value came back verbatim"))
+
+    # --- header/context checks: not tied to a body line ---
+    path = (request_values or {}).get("path", "") or ""
+    if re.search(r"/\d+(/|$)", path) or re.search(r"[?&](id|user_id|uid|acct|account)=\d+", path, re.I):
+        found.append((None, path, "Possible IDOR", "numeric ID in path/query"))
+
+    set_cookie = headers.get("set-cookie", "")
+    if set_cookie:
+        lower = set_cookie.lower()
+        missing = [f for f, present in (("HttpOnly", "httponly" in lower),
+                                         ("SameSite", "samesite" in lower)) if not present]
+        if STATE["scheme"] == "https" and "secure" not in lower:
+            missing.append("Secure")
+        if missing:
+            found.append((None, set_cookie[:100], "Cookie hardening gap", f"missing {', '.join(missing)}"))
+
+    location = headers.get("location", "")
+    if location and request_values:
+        for field, val in request_values.items():
+            if field in ("target", "scheme", "path"):
+                continue
+            if isinstance(val, str) and val and val in location:
+                found.append((None, location[:100], "Possible open redirect", f"Location reflects '{field}'"))
+                break
+
+    acao = headers.get("access-control-allow-origin", "")
+    acac = headers.get("access-control-allow-credentials", "")
+    if acao == "*" and acac.lower() == "true":
+        found.append((None, "Access-Control-Allow-Origin: * + credentials: true", "CORS misconfiguration", "wildcard origin + credentials"))
+    elif acao == "*":
+        found.append((None, "Access-Control-Allow-Origin: *", "Permissive CORS", "wildcard origin"))
+
+    # De-duplicate while preserving order.
+    seen = set()
+    deduped = []
+    for item in found:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
+
+
+def load_findings():
+    if not FINDINGS_FILE.exists():
+        return []
+    try:
+        return json.loads(FINDINGS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_finding(line_no, snippet, tag, hint, command):
+    STORE_DIR.mkdir(exist_ok=True)
+    findings = load_findings()
+    findings.append({
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "target": target_with_port(),
+        "line": line_no,
+        "snippet": snippet,
+        "tag": tag,
+        "hint": hint,
+        "command": command,
+        "confirmed": False,
+    })
+    FINDINGS_FILE.write_text(json.dumps(findings, indent=2))
+
+
+def show_findings():
+    findings = [f for f in load_findings() if f["target"] == target_with_port()]
+    if not findings:
+        print(f"\nNo findings logged yet for {target_with_port()}.")
+        return
+    print(f"\nFindings for {target_with_port()} ({len(findings)}):")
+    for i, f in enumerate(findings, 1):
+        mark = "✔ confirmed" if f.get("confirmed") else "unconfirmed"
+        where = f"line {f['line']}" if f.get("line") else "header/context"
+        print(f"  {i}) [{mark}] {f['tag']}  ({where}) - {f['hint']}")
+        print(f"      {f['snippet']}")
+        print(f"      from: {f['command']}")
+        if STATE.get("beginner_mode"):
+            explanation = explain_tag(f["tag"])
+            if explanation:
+                print(f"      ↳ what this means: {explanation}")
+    ans = prompt("\nMark one as confirmed/tested? (number, blank to skip)", default="")
+    if ans:
+        try:
+            idx = int(ans) - 1
+            all_findings = load_findings()
+            # map back to the global list index
+            target_findings_indices = [i for i, f in enumerate(all_findings) if f["target"] == target_with_port()]
+            global_idx = target_findings_indices[idx]
+            all_findings[global_idx]["confirmed"] = True
+            FINDINGS_FILE.write_text(json.dumps(all_findings, indent=2))
+            print("Marked as confirmed.")
+        except (ValueError, IndexError):
+            print("Not a valid choice.")
+
+
 def offer_inspection_menu(status_code, headers):
-    """
-    Fully opt-in entry point. Every option is itself just another curl
-    request aimed at understanding structure (methods, redirects,
-    verbosity) - nothing here picks a value or fires anything automatically.
-    """
     ans = ask("\nWant a menu of inspection follow-ups based on this response? [y/N]").lower()
     if ans != "y":
         return
@@ -466,9 +843,6 @@ def offer_inspection_menu(status_code, headers):
 
 
 def inspection_loop(status_code, headers):
-    """The actual options + handling. Separate from the opt-in gate above
-    so choosing to keep testing after a follow-up loops back here directly
-    instead of re-asking whether you want the menu at all."""
     current_path = STATE["last_values"].get("path", "/")
 
     options = []
@@ -520,14 +894,12 @@ def inspection_loop(status_code, headers):
             inspection_loop(new_status, new_headers)
 
 
-def execute_and_report(command):
+def execute_and_report(command, request_values=None):
     """
-    Actually run a command and show what came back - no confirmation, no
-    tweak prompt, no nested inspection offer. Used for one-click follow-ups
-    where the choice to run was already made; re-asking would just be the
-    same trap that broke the workflow before (typing a menu-looking answer
-    into what was actually a free-text flag prompt).
-    Returns (status_code, headers) so the caller can decide what's next.
+    Actually run a command and show what came back. Returns (status_code,
+    headers) so the caller can decide what's next. request_values, when
+    available, is passed through to the vuln-suggester purely to reason
+    about reflection/structure of the request that was actually sent.
     """
     print(f"\n$ {command}\n")
     try:
@@ -552,24 +924,278 @@ def execute_and_report(command):
         print("\n--- stderr ---")
         print(result.stderr)
 
-    signals = detect_signals(status_code, headers, body) if result.stdout else []
+    signals = detect_signals(status_code, headers) if result.stdout else []
     if signals:
         print("\nSignals worth noting:")
         for s in signals:
             print(f"  - {s}")
+
+    if result.stdout:
+        vulns = suggest_vulns(status_code, headers, body, request_values)
+        if vulns:
+            print("\n⚑ Worth a look (unconfirmed - verify manually):")
+            for line_no, snippet, tag, hint in vulns:
+                print_vuln_flag(line_no, snippet, tag, hint)
+                save_finding(line_no, snippet, tag, hint, command)
+            print(f"\n  Logged to {FINDINGS_FILE} - view anytime with 'f' at the main menu.")
 
     log_history(command)
     STATE["last_command"] = command
     return status_code, headers
 
 
-def run_command(command):
+# --- compare / diff mode -------------------------------------------------
+#
+# Send the same request shape multiple times with one field varied across
+# values YOU type in, then show what actually changed between responses -
+# status, size, timing, and a body diff. This is the same technique as
+# manually running curl a few times and eyeballing the differences; it just
+# does the running and diffing for you. It never picks or generates the
+# values being tested (no built-in payload lists) and never claims a
+# difference proves anything - a size/status/body change is a signal to go
+# confirm by hand, same posture as the rest of the tool.
+
+COMPARE_MARKER_STATUS = "___DARKPURL_STATUS___"
+COMPARE_MARKER_SIZE = "___DARKPURL_SIZE___"
+COMPARE_MARKER_TIME = "___DARKPURL_TIME___"
+
+
+def run_compare_command(command):
+    """
+    Run one curl command with -w markers appended so status/size/timing can
+    be parsed out even though -i is also in use. Returns a dict with
+    status_code, size, time, headers, body, raw_returncode - or None on a
+    hard failure to run curl at all.
+    """
+    wfmt = (
+        f"\\n{COMPARE_MARKER_STATUS}:%{{http_code}}"
+        f"\\n{COMPARE_MARKER_SIZE}:%{{size_download}}"
+        f"\\n{COMPARE_MARKER_TIME}:%{{time_total}}\\n"
+    )
+    full_command = f"{command} -w '{wfmt}'"
+    try:
+        result = subprocess.run(full_command, shell=True, capture_output=True, text=True)
+    except OSError as e:
+        print(f"\n⚠ Couldn't run the command at all: {e}")
+        return None
+
+    stdout = result.stdout
+    status, size, time_total = None, None, None
+    m = re.search(rf"{COMPARE_MARKER_STATUS}:(\d+)", stdout)
+    if m:
+        status = int(m.group(1))
+    m = re.search(rf"{COMPARE_MARKER_SIZE}:(\d+)", stdout)
+    if m:
+        size = int(m.group(1))
+    m = re.search(rf"{COMPARE_MARKER_TIME}:([\d.]+)", stdout)
+    if m:
+        time_total = float(m.group(1))
+
+    # Strip the marker block back out before parsing headers/body normally.
+    clean_stdout = re.split(rf"\n{COMPARE_MARKER_STATUS}:", stdout)[0]
+    _, headers, body = parse_response(clean_stdout)
+
+    return {
+        "command": full_command,
+        "status": status,
+        "size": size,
+        "time": time_total,
+        "headers": headers,
+        "body": body,
+        "returncode": result.returncode,
+        "stderr": result.stderr,
+    }
+
+
+def diff_bodies(baseline_body, body):
+    """Short summary of how two bodies differ - line count delta plus the
+    first few changed lines, not a full unified diff dump."""
+    import difflib
+    base_lines = baseline_body.splitlines()
+    new_lines = body.splitlines()
+    if base_lines == new_lines:
+        return None
+    sm = difflib.SequenceMatcher(a=base_lines, b=new_lines)
+    changed_blocks = [op for op in sm.get_opcodes() if op[0] != "equal"]
+    sample = []
+    for tag, i1, i2, j1, j2 in changed_blocks[:3]:
+        if tag in ("replace", "delete") and i1 < len(base_lines):
+            sample.append(f"    - {base_lines[i1][:90]}")
+        if tag in ("replace", "insert") and j1 < len(new_lines):
+            sample.append(f"    + {new_lines[j1][:90]}")
+    return {
+        "line_delta": len(new_lines) - len(base_lines),
+        "changed_blocks": len(changed_blocks),
+        "sample": sample,
+    }
+
+
+def compare_mode():
+    """
+    Build one request shape (any recipe, or the current path via a plain
+    GET), pick which field to vary, then type in a small list of values -
+    each one gets sent as its own request and the responses get compared
+    against the first as a baseline.
+    """
+    print("\nCompare mode: pick a recipe shape, then you'll choose one field to vary")
+    print("and type in each value to test (blank line when done, need at least 2).\n")
+
+    saved_recipes = load_saved_recipes()
+    all_recipes = BUILTIN_RECIPES + saved_recipes
+
+    recipe = None
+    if STATE.get("last_recipe"):
+        reuse = ask(
+            f"Use the same request shape you just sent as the base? [{STATE['last_recipe']['name']}] [Y/n]"
+        ).lower()
+        if reuse != "n":
+            recipe = STATE["last_recipe"]
+
+    if recipe is None:
+        cat_choice = choose(
+            [(k, label) for k, key, label in CATEGORIES if key not in ("crawl", "bruteenum", "paste")]
+            + [("g", "Plain GET on a path (simplest option)")],
+            "Which kind of request?",
+        )
+        if cat_choice is None:
+            return
+
+        if cat_choice == "g":
+            recipe = {"name": "(plain GET)", "category": "enum", "template": "curl -s -i {scheme}://{target}{path}"}
+        else:
+            cat_key = category_key_for(cat_choice)
+            recipe = recipe_menu(cat_key, all_recipes)
+            if recipe is None:
+                return
+
+    fields = placeholders_in(recipe["template"])
+    if not fields:
+        print("This recipe has no fillable fields to vary - pick another.")
+        return
+
+    # Put 'path' first if present - it's the most common thing to want to
+    # vary (a different endpoint/directory) after reusing a prior request.
+    ordered_fields = sorted(fields, key=lambda f: (f != "path",))
+    field_opts = [(str(i + 1), f) for i, f in enumerate(ordered_fields)]
+    field_choice = choose(field_opts, "Which field should vary across requests?")
+    if field_choice is None:
+        return
+    vary_field = dict(field_opts)[field_choice]
+
+    # Fill every other field once - held constant across all requests.
+    # Defaults come straight from the last request's values, so if you're
+    # reusing the last recipe you can just hit Enter to keep everything
+    # except the one field you're changing.
+    base_values = {"target": target_with_port(), "scheme": STATE["scheme"]}
+    for field in fields:
+        if field == vary_field:
+            continue
+        default = STATE["last_values"].get(field, "")
+        example = FIELD_EXAMPLES.get(field)
+        base_values[field] = prompt(field, default=default, example=example)
+        STATE["last_values"][field] = base_values[field]
+
+    print(f"\nNow enter values to test for '{vary_field}' - one per line, blank line to stop.")
+    example = FIELD_EXAMPLES.get(vary_field)
+    if example:
+        print(f"(e.g. {example})")
+    test_values = []
+    while True:
+        v = input(PROMPT_STR).strip()
+        if not v:
+            break
+        test_values.append(v)
+    if len(test_values) < 2:
+        print("Need at least 2 values to compare - back to the menu.")
+        return
+
+    commands = []
+    for v in test_values:
+        values = dict(base_values)
+        values[vary_field] = v
+        try:
+            commands.append((v, recipe["template"].format(**values)))
+        except (KeyError, ValueError, IndexError) as e:
+            print(f"⚠ Skipping '{v}' - couldn't build the command ({e}).")
+
+    if len(commands) < 2:
+        print("Not enough valid commands to compare.")
+        return
+
+    confirm = ask(f"About to send {len(commands)} requests, one per value. Run them? [Y/n]").lower()
+    if confirm == "n":
+        return
+
+    results = []
+    for v, cmd in commands:
+        print(f"\n$ {cmd}")
+        r = run_compare_command(cmd)
+        if r is None:
+            continue
+        r["value"] = v
+        results.append(r)
+        log_history(cmd)
+
+    if len(results) < 2:
+        print("\nNot enough responses came back to compare.")
+        return
+
+    baseline = results[0]
+    print(f"\nBaseline value: '{baseline['value']}'  ->  status {baseline['status']}, "
+          f"size {baseline['size']}, time {baseline['time']}s")
+
+    print(f"\n{'value':<20} {'status':<8} {'size':<10} {'time':<8} {'vs baseline'}")
+    print("-" * 70)
+    for r in results:
+        vs = "-- baseline --" if r is baseline else ""
+        if r is not baseline:
+            bits = []
+            if r["status"] != baseline["status"]:
+                bits.append(f"status {baseline['status']}→{r['status']}")
+            if r["size"] is not None and baseline["size"] is not None and r["size"] != baseline["size"]:
+                bits.append(f"size {baseline['size']}→{r['size']}")
+            vs = ", ".join(bits) if bits else "same status/size"
+        print(f"{r['value']:<20} {str(r['status']):<8} {str(r['size']):<10} {str(r['time']):<8} {vs}")
+
+    print("\nBody differences vs baseline:")
+    any_diff = False
+    for r in results:
+        if r is baseline:
+            continue
+        d = diff_bodies(baseline["body"], r["body"])
+        if d is None:
+            print(f"  '{r['value']}': identical body to baseline")
+            continue
+        any_diff = True
+        print(f"  '{r['value']}': {d['changed_blocks']} changed block(s), "
+              f"{d['line_delta']:+d} line(s) vs baseline")
+        for line in d["sample"]:
+            print(line)
+
+    if not any_diff:
+        print("  No response bodies differed from the baseline.")
+    print("\nA response that varies (status, size, timing, or body) is a signal worth")
+    print("confirming manually - not proof on its own. Each response was also scanned")
+    print("for the usual signals/flags above as it came in.")
+
+    # Run the existing signal/vuln scanners against each non-identical
+    # response so anything interesting still surfaces per-value.
+    for r in results:
+        vulns = suggest_vulns(r["status"], r["headers"], r["body"], {vary_field: r["value"]})
+        if vulns:
+            print(f"\n  Flags for '{r['value']}':")
+            for line_no, snippet, tag, hint in vulns:
+                print_vuln_flag(line_no, snippet, tag, hint)
+                save_finding(line_no, snippet, tag, hint, r["command"])
+
+    STATE["last_command"] = commands[-1][1]
+    STATE["last_recipe"] = recipe
+
+
+def run_command(command, request_values=None):
     """
     The full interactive build-and-send cycle: show the command, explain
-    its flags, offer to tweak it, confirm, then execute. Used whenever the
-    command is being newly built (recipes, the request builder, paste
-    import, quick-look) - situations where a tweak/confirm step adds real
-    value because the request itself is still fresh.
+    its flags, offer to tweak it, confirm, then execute.
     """
     print(f"\n$ {command}\n")
     explain_command(command)
@@ -587,7 +1213,7 @@ def run_command(command):
     if confirm == "n":
         return
 
-    status_code, headers = execute_and_report(command)
+    status_code, headers = execute_and_report(command, request_values)
 
     if status_code is not None:
         print("That's the full response - your call on what to do next from the menu.")
@@ -601,13 +1227,33 @@ def offer_save(recipe, command, values, saved_recipes):
     if ans != "y":
         return
     name = prompt("Name for this recipe", default=recipe["name"] + " (custom)")
-    # rebuild a template: swap the literal values back out for placeholders
-    # so the saved recipe stays reusable, not hardcoded to this one run.
     template = recipe["template"]
     new_recipe = {"name": name, "category": recipe["category"], "template": template}
     saved_recipes.append(new_recipe)
     save_recipes(saved_recipes)
     print(f"Saved '{name}' to {STORE_FILE}")
+
+
+def repeat_edit_last():
+    """
+    Re-send the exact same request shape as last time, with every field
+    already defaulted to the value you used last - hit Enter through
+    anything unchanged, and only type over the one thing you want to
+    change (a different path, a different id, etc). This is the fastest
+    path back into a request you already built once.
+    """
+    recipe = STATE.get("last_recipe")
+    if recipe is None:
+        print("\nNo previous request to repeat yet - run one first.")
+        return
+    print(f"\nRepeating: {recipe['name']}  (blank/Enter keeps the previous value shown in [brackets])")
+    result = fill_template(recipe)
+    if result is None:
+        return
+    command, values = result
+    run_command(command, request_values=values)
+    STATE["last_recipe"] = recipe
+    offer_save(recipe, command, values, load_saved_recipes())
 
 
 COMMON_PORTS = ["80", "443", "8080", "8000", "8443", "3000", "5000", "8888", "9000"]
@@ -633,11 +1279,6 @@ def change_port():
 
 
 def normalize_target(raw):
-    """
-    Accepts messy input (scheme prefix, trailing path, trailing slash) and
-    returns (clean_host_or_hostport, detected_scheme_or_None, warnings).
-    Never silently changes something without saying so.
-    """
     working = raw.strip()
     scheme = None
     warnings = []
@@ -665,9 +1306,14 @@ def normalize_target(raw):
     return working, scheme, warnings
 
 
-def get_target_input(prompt_text, default=None):
+def get_target_input(prompt_text, default=None, allow_back=False):
+    """Returns the cleaned-up target, or None if allow_back=True and the
+    user typed 'b' to bail back out to the caller instead of entering one."""
     while True:
-        raw = prompt(prompt_text, default=default, example="10.10.11.42 or http://10.10.11.42:8080")
+        hint = f"{prompt_text} (or 'b' to go back to the main menu)" if allow_back else prompt_text
+        raw = prompt(hint, default=default, example="10.10.11.42 or http://10.10.11.42:8080")
+        if allow_back and raw.strip().lower() == "b":
+            return None
         if not raw:
             print("Target can't be empty - try again.")
             continue
@@ -684,9 +1330,6 @@ def get_target_input(prompt_text, default=None):
 
 # --- crawl / enum mode -------------------------------------------------
 
-# Heuristic extractors - not a substitute for gobuster/ffuf/burp's crawler,
-# but enough to surface obvious links, forms, and JS-embedded API calls
-# without leaving the tool.
 LINK_ATTR_RE = re.compile(r'''(?:href|src|action)\s*=\s*["']([^"'#][^"']*)["']''', re.IGNORECASE)
 JS_STRING_PATH_RE = re.compile(r'''["'](/[a-zA-Z0-9_\-./]{2,})["']''')
 
@@ -740,12 +1383,10 @@ def base_url():
 
 
 def cookie_jar_flag():
-    """The -b flag for reusing a saved cookie jar, if one exists in the cwd."""
     return "-b cookies.txt " if Path("cookies.txt").exists() else ""
 
 
 def fetch_body(path):
-    """GET a path, reusing the cookie jar if one exists from a prior login."""
     cmd = f"curl -s -L {cookie_jar_flag()}{base_url()}{path}"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     return result.stdout
@@ -765,7 +1406,7 @@ def extract_paths(text):
         if link.startswith("http"):
             parsed = urllib.parse.urlparse(link)
             if parsed.netloc and STATE["target"] not in parsed.netloc:
-                continue  # off-target, skip
+                continue
             normalized.add(parsed.path or "/")
         elif link.startswith("/"):
             normalized.add(link)
@@ -827,6 +1468,106 @@ def enum_mode():
     offer_investigate(hits)
 
 
+def auto_scan():
+    """
+    The fast path from 'here's a target' to 'here's what's worth testing'.
+    Crawls a starting page for links, optionally also probes the common
+    backend-path wordlist, then sends one plain GET to every path found
+    and runs the same line-level vuln scanner used everywhere else in the
+    tool against each response - all in one pass, with one findings
+    summary at the end instead of checking each result by hand.
+
+    Still fully passive: every request is a plain GET, nothing is ever
+    injected or mutated to provoke a response - this is the existing
+    crawl + enum + flag pipeline chained together, not a new capability.
+    You confirm once before the batch of requests goes out, same as enum
+    mode already does.
+    """
+    print("\nAuto-scan: crawl a page, optionally probe common paths, then check")
+    print("every path found for the same signals the rest of the tool looks for.\n")
+
+    start_path = prompt("Starting path to crawl", default=STATE["last_values"].get("path", "/"), example="/")
+    STATE["last_values"]["path"] = start_path
+    include_enum = yn_prompt("Also probe the built-in common-paths wordlist?", default=True)
+
+    print(f"\nCrawling {base_url()}{start_path} ...")
+    body = fetch_body(start_path)
+    crawled = sorted(extract_paths(body)) if body else []
+    print(f"  found {len(crawled)} link(s) on that page" if crawled else "  nothing extracted from that page")
+
+    all_paths = set(crawled)
+    all_paths.add(start_path)
+
+    if include_enum:
+        cookie_flag = cookie_jar_flag()
+        print(f"\nProbing {len(BUILTIN_WORDLIST)} common paths ...")
+        for word in BUILTIN_WORDLIST:
+            path = "/" + word.lstrip("/")
+            cmd = f"curl -s -o /dev/null -w '%{{http_code}}' {cookie_flag}{base_url()}{path}"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            except OSError:
+                continue
+            code = result.stdout.strip()
+            if code and code not in ("000", "404"):
+                print(f"  {code}  {path}")
+                all_paths.add(path)
+
+    all_paths = sorted(all_paths)
+    record_discoveries(all_paths, source="scan")
+
+    print(f"\n{len(all_paths)} path(s) to check:")
+    for p in all_paths:
+        print(f"  {p}")
+
+    if not yn_prompt(f"\nSend a GET to each of these {len(all_paths)} path(s) and scan the responses?", default=True):
+        return
+
+    cookie_flag = cookie_jar_flag()
+    findings_by_path = {}
+    last_cmd = None
+    for path in all_paths:
+        cmd = f"curl -s -i {cookie_flag}{base_url()}{path}"
+        last_cmd = cmd
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        except OSError as e:
+            print(f"  ⚠ {path}: couldn't run curl ({e})")
+            continue
+        log_history(cmd)
+        if not result.stdout:
+            print(f"  {path}: no response")
+            continue
+        status, headers, resp_body = parse_response(result.stdout)
+        vulns = suggest_vulns(status, headers, resp_body, {"path": path})
+        if vulns:
+            print(f"  ⚑ {path}  (status {status}) - {len(vulns)} flag(s)")
+            findings_by_path[path] = vulns
+            for line_no, snippet, tag, hint in vulns:
+                save_finding(line_no, snippet, tag, hint, cmd)
+        else:
+            print(f"  {path}  (status {status}) - nothing flagged")
+
+    if last_cmd:
+        STATE["last_command"] = last_cmd
+
+    if not findings_by_path:
+        print("\nNothing flagged across any of the paths checked.")
+        print("That doesn't mean it's clean - just that nothing matched the patterns this tool knows.")
+        return
+
+    total = sum(len(v) for v in findings_by_path.values())
+    print(f"\n{'=' * 60}")
+    print(f"SCAN SUMMARY - {total} flag(s) across {len(findings_by_path)} path(s)")
+    print("=" * 60)
+    for path, vulns in findings_by_path.items():
+        print(f"\n{path}")
+        for line_no, snippet, tag, hint in vulns:
+            print_vuln_flag(line_no, snippet, tag, hint)
+
+    print(f"\nAll of this is also saved to {FINDINGS_FILE} - view/mark items anytime with 'f' at the main menu.")
+
+
 def offer_investigate(paths):
     ans = prompt("\nTest one of these further? (number, or blank to skip)", default="")
     if not ans:
@@ -852,16 +1593,16 @@ def show_sitemap():
 
 
 def paste_import():
-    """
-    Take a curl command from anywhere (browser devtools 'Copy as cURL',
-    Burp's 'Copy as curl command', a writeup, your own terminal history)
-    and drop it straight into the tool. The current target/scheme are
-    auto-swapped for {target}/{scheme} so it's reusable on the next box;
-    you can hand-add other {placeholder} names in the pasted text too.
-    """
     print("\nPaste a full curl command (single line).")
     print("Tip: any {word} you type becomes a field you'll be prompted for.")
-    raw = input(PROMPT_STR).strip()
+
+    def collect_paste():
+        raw_in = input(PROMPT_STR).strip()
+        if raw_in:
+            STATE["last_pasted"] = raw_in
+        return raw_in
+
+    raw = with_reuse("Reuse the last command you pasted here?", STATE.get("last_pasted"), collect_paste, default=False)
     if not raw:
         return
 
@@ -887,52 +1628,62 @@ def paste_import():
         return
     command, values = result
 
-    run_command(command)
+    run_command(command, request_values=values)
+    STATE["last_recipe"] = recipe
     offer_save(recipe, command, values, load_saved_recipes())
 
 
 def quick_look():
-    """
-    The 'start here' move. One plain GET, full response shown, then the
-    normal signal-detection + inspection-menu flow takes over from there -
-    no knowledge of the target assumed going in.
-    """
     path = prompt("Path for the quick look", default=STATE["last_values"].get("path", "/"), example="/")
     STATE["last_values"]["path"] = path
-    run_command(f"curl -s -i {base_url()}{path}")
+    STATE["last_recipe"] = {"name": "(quick look)", "category": "enum", "template": "curl -s -i {scheme}://{target}{path}"}
+    run_command(f"curl -s -i {base_url()}{path}", request_values={"path": path})
 
 
 def raw_builder():
-    """
-    Full manual control over every piece of the request - method, headers,
-    cookies, body - assembled one field at a time. For when you already
-    know exactly what you want to send and just want to build it fast,
-    rather than hunting for the closest-matching named recipe.
-    """
     print("\nFull request builder - set each part, blank to skip any of them.\n")
+    last = STATE.get("last_raw")  # dict of everything used last time in this builder, or None
 
     method_opts = [
         ("1", "GET"), ("2", "POST"), ("3", "PUT"), ("4", "DELETE"),
         ("5", "PATCH"), ("6", "HEAD"), ("7", "OPTIONS"), ("8", "Custom method"),
     ]
-    method_choice = choose(method_opts, "HTTP method:")
-    if method_choice is None:
-        return
-    if method_choice == "8":
-        http_method = prompt("Custom method", example="TRACE").strip().upper() or "GET"
+
+    def pick_method():
+        choice = choose(method_opts, "HTTP method:")
+        if choice is None:
+            return None
+        if choice == "8":
+            return prompt("Custom method", example="TRACE").strip().upper() or "GET"
+        return dict(method_opts)[choice]
+
+    if last:
+        http_method = with_reuse(f"Same HTTP method as last time ({last['method']})?", last["method"], pick_method)
     else:
-        http_method = dict(method_opts)[method_choice]
+        http_method = pick_method()
+    if http_method is None:
+        return
 
     path = prompt("Path", default=STATE["last_values"].get("path", "/"), example="/api/v1/users")
     STATE["last_values"]["path"] = path
 
-    print("\nHeaders - add one at a time, blank line to stop.")
-    headers = []
-    while True:
-        h = prompt("Header", example="Authorization: Bearer <token>")
-        if not h:
-            break
-        headers.append(h)
+    def collect_headers():
+        print("\nHeaders - add one at a time, blank line to stop.")
+        hs = []
+        while True:
+            h = prompt("Header", example="Authorization: Bearer <token>")
+            if not h:
+                break
+            hs.append(h)
+        return hs
+
+    if last:
+        headers = with_reuse(
+            f"Reuse the same {len(last['headers'])} header(s) as last time?" if last["headers"] else "Same headers as last time (none)?",
+            last["headers"], collect_headers,
+        )
+    else:
+        headers = collect_headers()
 
     cookie = prompt(
         "Cookie header (blank to skip)",
@@ -942,22 +1693,28 @@ def raw_builder():
     if cookie:
         STATE["last_values"]["cookie"] = cookie
 
-    body = ""
-    is_json = False
-    body_choice = choose(
-        [("1", "No body"), ("2", "Form data (key=value&key2=value2)"), ("3", "Raw JSON"), ("4", "Raw/custom data")],
-        "Body:",
-    )
-    if body_choice == "2":
-        body = prompt("Form data", example="username=admin&password=admin")
-    elif body_choice == "3":
-        body = prompt("JSON body", example='{"username":"admin"}')
-        is_json = True
-    elif body_choice == "4":
-        body = prompt("Raw data", example="anything")
+    def collect_body():
+        body_choice = choose(
+            [("1", "No body"), ("2", "Form data (key=value&key2=value2)"), ("3", "Raw JSON"), ("4", "Raw/custom data")],
+            "Body:",
+        )
+        if body_choice == "2":
+            return prompt("Form data", example="username=admin&password=admin"), False
+        if body_choice == "3":
+            return prompt("JSON body", example='{"username":"admin"}'), True
+        if body_choice == "4":
+            return prompt("Raw data", example="anything"), False
+        return "", False
 
-    follow_redirects = ask("Follow redirects with -L? [y/N]").lower() == "y"
-    insecure = ask("Skip TLS verification with -k? [y/N]").lower() == "y"
+    if last and last["body"]:
+        body, is_json = with_reuse(
+            f"Reuse the same body as last time ({last['body'][:40]!r})?", (last["body"], last["is_json"]), collect_body
+        )
+    else:
+        body, is_json = collect_body()
+
+    follow_redirects = yn_prompt("Follow redirects with -L?", default=last["follow_redirects"] if last else False)
+    insecure = yn_prompt("Skip TLS verification with -k?", default=last["insecure"] if last else False)
 
     parts = ["curl", "-s", "-i", "-X", http_method]
     for h in headers:
@@ -978,8 +1735,14 @@ def raw_builder():
     literal_base = f"{STATE['scheme']}://{target_with_port()}"
     reusable_template = command.replace(literal_base, "{scheme}://{target}")
 
-    run_command(command)
+    STATE["last_raw"] = {
+        "method": http_method, "headers": headers, "body": body,
+        "is_json": is_json, "follow_redirects": follow_redirects, "insecure": insecure,
+    }
+
+    run_command(command, request_values={"path": path, "body": body, "cookie": cookie})
     recipe_stub = {"name": "(built manually)", "category": "raw", "template": reusable_template}
+    STATE["last_recipe"] = recipe_stub
     offer_save(recipe_stub, command, {}, load_saved_recipes())
 
 
@@ -1003,67 +1766,191 @@ BOOT_SEQUENCE = [
     "[+] Target handler ready",
 ]
 
+MENU_PREVIEW = [
+    ("a", "Auto-scan", "Crawl a page, hit every path found, and flag anything worth checking - fastest way to go from target to findings."),
+    ("0", "Quick look", "One plain GET request - the fastest way to see what a website sends back."),
+    ("1", "Login portal test", "Try logging in - normal form login, saving a cookie, NTLM, or basic auth."),
+    ("2", "API check", "Send a request to an API - with a token, a JSON body, or a custom header."),
+    ("3", "Check a path", "Check if a page/file exists, see its headers and content, follow redirects, skip TLS checks."),
+    ("4", "Custom value test", "Put a value of your choosing into a URL param, form field, or header."),
+    ("5", "Session / cookie test", "Send a specific cookie, reuse a saved login, or try swapping a cookie's value."),
+    ("6", "Saved custom requests", "Anything you've built with the full request builder or saved from a paste - empty until you save one."),
+    ("7", "Crawl mode", "Pull every link/API path out of one page and build a map of the site."),
+    ("8", "Enum mode", "Try a list of common file/folder names against the target, see what exists."),
+    ("9", "Paste a curl command", "Copied a curl command from your browser or Burp? Paste it in and reuse it."),
+    ("r", "Full request builder", "Build a request piece by piece - method, headers, cookies, body."),
+    ("c", "Compare mode", "Send the same request several times with one thing changed, see what's different."),
+    ("e", "Repeat/edit last request", "Re-send your last request with everything pre-filled in - shows up after your first request."),
+    ("m", "Sitemap", "Every page/path this tool has found on the current target so far."),
+    ("f", "Findings log", "Everything flagged as worth checking so far - mark items off as you confirm them."),
+    ("h", "Command history", "Every curl command you've actually run, searchable."),
+    ("t", "Change target", "Point the tool at a different host or IP."),
+    ("s", "Switch scheme", "Toggle between http and https."),
+    ("p", "Change port", "Set or clear a specific port to use."),
+    ("x", "Beginner explanations", "Toggle plain-English 'what this means' notes on flagged findings (on by default)."),
+]
+
+
+def show_menu_preview():
+    """
+    Browse the menu without a target set: shows a bare list of options
+    (no descriptions), lets the user pick one to read what it does, then
+    offers to go back to the list, back to the main menu, or run that
+    option right now. Returns the picked key only if 'run it now' was
+    chosen and a real menu action exists for it - otherwise None.
+    """
+    while True:
+        clear_screen()
+        print(BANNER)
+        print("Pick an option to see what it does.\n")
+        opts = [(key, name) for key, name, _ in MENU_PREVIEW]
+        choice = choose(opts, "Menu options:", allow_back=False)
+
+        name = dict((k, n) for k, n, _ in MENU_PREVIEW)[choice]
+        desc = dict((k, d) for k, _, d in MENU_PREVIEW)[choice]
+        clear_screen()
+        print(BANNER)
+        print(f"{choice}) {name}\n")
+        print(f"  {desc}\n")
+
+        next_choice = choose(
+            [("1", "Back to the list"), ("2", "Back to main menu"), ("3", f"Use it now")],
+            "What next?",
+            allow_back=False,
+        )
+        if next_choice == "1":
+            continue
+        if next_choice == "3":
+            return choice
+        return None
+
+
+def dispatch_action(top_choice):
+    """
+    Run one top-level menu action given its key. This is the single place
+    that maps a menu key to what actually happens - used by the normal
+    menu loop, and also by 'Use it now' from the menu preview when it's
+    picked before a target has even been entered (the target gets set
+    first, then this runs immediately after instead of dropping the user
+    back at the welcome screen with nothing having happened).
+    """
+    saved_recipes = load_saved_recipes()
+    all_recipes = BUILTIN_RECIPES + saved_recipes
+
+    if top_choice == "a":
+        auto_scan()
+        return
+    if top_choice == "t":
+        STATE["target"] = get_target_input("New target", default=STATE["target"])
+        return
+    if top_choice == "s":
+        STATE["scheme"] = "https" if STATE["scheme"] == "http" else "http"
+        return
+    if top_choice == "x":
+        STATE["beginner_mode"] = not STATE["beginner_mode"]
+        return
+    if top_choice == "p":
+        change_port()
+        return
+    if top_choice == "c":
+        compare_mode()
+        return
+    if top_choice == "e":
+        repeat_edit_last()
+        return
+    if top_choice == "m":
+        show_sitemap()
+        return
+    if top_choice == "f":
+        show_findings()
+        return
+    if top_choice == "h":
+        show_history()
+        return
+    if top_choice == "7":
+        crawl_mode()
+        return
+    if top_choice == "8":
+        enum_mode()
+        return
+    if top_choice == "9":
+        paste_import()
+        return
+    if top_choice == "0":
+        quick_look()
+        return
+    if top_choice == "r":
+        raw_builder()
+        return
+
+    cat_key = category_key_for(top_choice)
+    recipe = recipe_menu(cat_key, all_recipes)
+    if recipe is None:
+        return
+
+    result = fill_template(recipe)
+    if result is None:
+        return
+    command, values = result
+
+    run_command(command, request_values=values)
+    STATE["last_recipe"] = recipe
+    offer_save(recipe, command, values, saved_recipes)
+
 
 def main():
     clear_screen()
     print(BANNER)
     for line in BOOT_SEQUENCE:
         print(line)
-    print("(press q at any menu to quit)\n")
-    STATE["target"] = get_target_input("Target (host or IP - you can type host:port here too)")
+        time.sleep(0.35)
+    time.sleep(0.5)
 
-    start = ask("\nNew to this target? Send a quick GET to see what's there first? [Y/n]").lower()
-    if start != "n":
-        quick_look()
+    pending_action = None
+    while True:
+        clear_screen()
+        print(BANNER)
+        print("(press q at any menu to quit)")
+        print("New here? When something's flagged as a possible issue, this tool adds a plain-English")
+        print("note explaining what it means and why it matters - ON by default, toggle with 'x' in the menu.\n")
+
+        entry_choice = choose(
+            [
+                ("1", "Find vulnerabilities fast (auto-scan)"),
+                ("2", "View menu options"),
+            ],
+            "Main menu:",
+            allow_back=False,
+        )
+        if entry_choice == "2":
+            picked = show_menu_preview()
+            if picked is None:
+                continue
+            pending_action = picked
+        elif entry_choice == "1":
+            pending_action = "a"
+
+        clear_screen()
+        print(BANNER)
+        print("Let's get started - point DARKPURL at a target.\n")
+        target = get_target_input("Target (host or IP - you can type host:port here too)", allow_back=True)
+        if target is None:
+            pending_action = None
+            continue
+        STATE["target"] = target
+        break
+
+    if pending_action:
+        dispatch_action(pending_action)
 
     while True:
-        saved_recipes = load_saved_recipes()
-        all_recipes = BUILTIN_RECIPES + saved_recipes
-
         top_choice = category_menu()
-        if top_choice == "t":
-            STATE["target"] = get_target_input("New target", default=STATE["target"])
-            continue
-        if top_choice == "s":
-            STATE["scheme"] = "https" if STATE["scheme"] == "http" else "http"
-            continue
-        if top_choice == "p":
-            change_port()
-            continue
-        if top_choice == "m":
-            show_sitemap()
-            continue
-        if top_choice == "h":
-            show_history()
-            continue
-        if top_choice == "7":
-            crawl_mode()
-            continue
-        if top_choice == "8":
-            enum_mode()
-            continue
-        if top_choice == "9":
-            paste_import()
-            continue
-        if top_choice == "0":
-            quick_look()
-            continue
-        if top_choice == "r":
-            raw_builder()
-            continue
-
-        cat_key = category_key_for(top_choice)
-        recipe = recipe_menu(cat_key, all_recipes)
-        if recipe is None:
-            continue
-
-        result = fill_template(recipe)
-        if result is None:
-            continue
-        command, values = result
-
-        run_command(command)
-        offer_save(recipe, command, values, saved_recipes)
+        if top_choice == "?":
+            picked = show_menu_preview()
+            if picked is None:
+                continue
+            top_choice = picked  # fall through - handled the same as if just chosen
+        dispatch_action(top_choice)
 
 
 if __name__ == "__main__":
