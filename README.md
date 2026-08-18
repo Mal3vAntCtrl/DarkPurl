@@ -1,3 +1,4 @@
+![DarkPurl](assets/DarkPurl.png)
 # DarkPurl
 
 > **curl-native HTTP inspection & workflow tool for penetration testing and CTFs.**
