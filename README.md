@@ -17,9 +17,11 @@ See the full [CHANGELOG](CHANGELOG.md) for detailed release notes.
 
 ## Overview
 
-DarkPurl is an interactive, menu-driven wrapper around `curl` that simplifies common HTTP reconnaissance and testing workflows. Instead of remembering lengthy command-line syntax, DarkPurl guides you through building requests, inspecting responses, and replaying common attack scenarios through an intuitive interface.
+DarkPurl is an interactive, menu-driven wrapper around curl that simplifies HTTP reconnaissance and testing workflows. Instead of remembering lengthy command-line syntax, DarkPurl guides you through building requests, inspecting responses, and working through common testing patterns — logins, API auth, session handling, and more — through a guided interface.
 
-Designed for penetration testers, students, and CTF players, DarkPurl streamlines repetitive web testing tasks while remaining lightweight and dependency-free.
+Beyond request building, DarkPurl can automatically crawl a target, probe common paths (or import results from dirb/gobuster/ffuf), and flag responses that look worth investigating — SQL/template injection signatures, exposed debug pages, IDOR patterns, misconfigurations, and more — each with a plain-English explanation of what it means.
+
+Designed for penetration testers, students, and CTF players, DarkPurl streamlines repetitive web testing tasks while remaining lightweight, passive by design, and dependency-free.
 
 ---
 
