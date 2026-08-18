@@ -1,4 +1,10 @@
 ![DarkPurl](assets/DarkPurl.png)
+<p align="center">
+  <img src="assets/DarkPurl.png" alt="DarkPurl">
+</p>
+<p align="center">
+  <img src="assets/DarkPurl.png" alt="DarkPurl" width="600">
+</p>
 # DarkPurl
 
 > **curl-native HTTP inspection & workflow tool for penetration testing and CTFs.**
